@@ -39,6 +39,7 @@ from a2a.types import (
     SetTaskPushNotificationConfigRequest,
     TaskResubscriptionRequest,
     UnsupportedOperationError,
+    MethodNotFoundError, InvalidParamsError,
 )
 from a2a.utils.errors import MethodNotImplementedError
 
@@ -181,6 +182,15 @@ class A2AStarletteApplication:
 
         try:
             body = await request.json()
+            # Try to extract request_id early for better error responses
+            if isinstance(body, dict):
+                raw_id = body.get('id')
+                # Only use the ID if it's a valid type (string or int)
+                if isinstance(raw_id, (str, int)):
+                    request_id = raw_id
+                else:
+                    request_id = None  # Invalid ID type, use None for error response
+            
             a2a_request = A2ARequest.model_validate(body)
             call_context = self._context_builder.build(request)
 
@@ -210,10 +220,43 @@ class A2AStarletteApplication:
             )
         except ValidationError as e:
             traceback.print_exc()
-            return self._generate_error_response(
-                request_id,
-                A2AError(root=InvalidRequestError(data=json.loads(e.json()))),
-            )
+            # Analyze the validation error to provide more specific JSON-RPC error codes
+            error_data = json.loads(e.json())
+            
+            # Check if this is an invalid request structure (should be -32600)
+            if self._is_invalid_request_structure(body, error_data):
+                return self._generate_error_response(
+                    request_id,
+                    A2AError(root=InvalidRequestError(data=error_data))
+                )
+            
+            # Check if this is a missing method error (should be -32601)
+            elif self._is_missing_method_error(body, error_data):
+                return self._generate_error_response(
+                    request_id,
+                    A2AError(root=MethodNotFoundError())
+                )
+            
+            # Check if this is an unknown method error (should be -32601)
+            elif self._is_unknown_method_error(body, error_data):
+                return self._generate_error_response(
+                    request_id,
+                    A2AError(root=MethodNotFoundError())
+                )
+            
+            # Check if this is an invalid params error (should be -32602)
+            elif self._is_invalid_params_error(body, error_data):
+                return self._generate_error_response(
+                    request_id,
+                    A2AError(root=InvalidParamsError(data=error_data))
+                )
+            
+            # Default to invalid request error (-32600)
+            else:
+                return self._generate_error_response(
+                    request_id,
+                    A2AError(root=InvalidRequestError(data=error_data)),
+                )
         except Exception as e:
             logger.error(f'Unhandled exception: {e}')
             traceback.print_exc()
@@ -461,3 +504,54 @@ class A2AStarletteApplication:
             kwargs['routes'] = app_routes
 
         return Starlette(**kwargs)
+
+    def _is_invalid_request_structure(self, body: dict, error_data: list) -> bool:
+        """Check if the validation error is due to invalid request structure (like invalid ID type)."""
+        # Check if there are errors related to the ID field type
+        for error in error_data:
+            if isinstance(error, dict):
+                loc = error.get('loc', [])
+                error_type = error.get('type', '')
+                # If the error is about the ID field type (not in params), it's invalid request structure
+                if len(loc) >= 2 and loc[1] == 'id' and error_type in ['string_type', 'int_type']:
+                    return True
+        return False
+
+    def _is_missing_method_error(self, body: dict, error_data: list) -> bool:
+        """Check if the validation error is due to a missing method field."""
+        # If the request has jsonrpc but no method, it's a missing method error
+        if isinstance(body, dict) and body.get('jsonrpc') == '2.0' and 'method' not in body:
+            return True
+        return False
+
+    def _is_unknown_method_error(self, body: dict, error_data: list) -> bool:
+        """Check if the validation error is due to an unknown method field."""
+        # If the request has jsonrpc and method, but method is not known
+        if isinstance(body, dict) and body.get('jsonrpc') == '2.0' and 'method' in body:
+            method = body.get('method', '')
+            known_methods = [
+                'message/send', 'message/stream', 'tasks/get', 'tasks/cancel',
+                'tasks/pushNotificationConfig/set', 'tasks/pushNotificationConfig/get',
+                'tasks/resubscribe'
+            ]
+            if method not in known_methods:
+                return True
+        return False
+
+    def _is_invalid_params_error(self, body: dict, error_data: list) -> bool:
+        """Check if the validation error is due to invalid parameters."""
+        # If the request has a valid method but the params are wrong, it's invalid params
+        if isinstance(body, dict) and body.get('jsonrpc') == '2.0' and 'method' in body:
+            method = body.get('method', '')
+            # Check if it's a known method with invalid params
+            known_methods = [
+                'message/send', 'message/stream', 'tasks/get', 'tasks/cancel',
+                'tasks/pushNotificationConfig/set', 'tasks/pushNotificationConfig/get',
+                'tasks/resubscribe'
+            ]
+            if method in known_methods:
+                # If it's a known method but validation failed, it's likely invalid params
+                # But first check if it's not an invalid request structure issue
+                if not self._is_invalid_request_structure(body, error_data):
+                    return True
+        return False
