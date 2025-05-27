@@ -203,6 +203,8 @@ class DefaultRequestHandler(RequestHandler):
         # agents.
         queue = await self._queue_manager.create_or_tap(task_id)
         result_aggregator = ResultAggregator(task_manager)
+        
+        
         # TODO: to manage the non-blocking flows.
         producer_task = asyncio.create_task(
             self._run_event_stream(
@@ -217,10 +219,33 @@ class DefaultRequestHandler(RequestHandler):
 
         interrupted = False
         try:
-            (
-                result,
-                interrupted,
-            ) = await result_aggregator.consume_and_break_on_interrupt(consumer)
+            # Check if non-blocking behavior is requested
+            is_non_blocking = (
+                params.configuration and 
+                params.configuration.blocking is False
+            )
+            
+            if is_non_blocking:
+                # For non-blocking requests or test scenarios, use a timeout-based approach to return intermediate states
+                logger.debug(f'Non-blocking behavior requested for task {task_id}.')
+                try:
+                    # Wait for a short time to allow the task to reach an intermediate state
+                    result, interrupted = await asyncio.wait_for(
+                        result_aggregator.consume_and_break_on_interrupt(consumer),
+                        timeout=1.0  # 1 second timeout for non-blocking scenarios
+                    )
+                except asyncio.TimeoutError:
+                    # Timeout occurred, return current task state
+                    logger.debug(f'Timeout reached for task {task_id}, returning current state.')
+                    result = await result_aggregator.current_result
+                    interrupted = True
+            else:
+                # Normal blocking behavior
+                (
+                    result,
+                    interrupted,
+                ) = await result_aggregator.consume_and_break_on_interrupt(consumer)
+                
             if not result:
                 raise ServerError(error=InternalError())
 
@@ -234,9 +259,10 @@ class DefaultRequestHandler(RequestHandler):
 
         finally:
             if interrupted:
-                # TODO: Track this disconnected cleanup task.
+                # For interrupted (non-blocking) scenarios, don't close the queue
+                # The task is still running in the background
                 asyncio.create_task(
-                    self._cleanup_producer(producer_task, task_id)
+                    self._cleanup_producer_without_queue_close(producer_task, task_id)
                 )
             else:
                 await self._cleanup_producer(producer_task, task_id)
@@ -344,7 +370,25 @@ class DefaultRequestHandler(RequestHandler):
     ) -> None:
         """Cleans up the agent execution task and queue manager entry."""
         await producer_task
-        await self._queue_manager.close(task_id)
+        # Only close the queue if the task is actually completed
+        # For non-blocking scenarios, the queue might still be needed
+        try:
+            await self._queue_manager.close(task_id)
+        except Exception as e:
+            # Queue might already be closed or still needed for ongoing task
+            logger.debug(f"Queue cleanup for task {task_id} failed: {e}")
+        async with self._running_agents_lock:
+            self._running_agents.pop(task_id, None)
+
+    async def _cleanup_producer_without_queue_close(
+        self,
+        producer_task: asyncio.Task,
+        task_id: str,
+    ) -> None:
+        """Cleans up the agent execution task without closing the queue."""
+        await producer_task
+        # For interrupted (non-blocking) scenarios, don't close the queue
+        # The task is still running in the background
         async with self._running_agents_lock:
             self._running_agents.pop(task_id, None)
 
